@@ -2,16 +2,12 @@
 import os
 import time
 import json
-import logging
 import praw
 import prawcore
-from dotenv import load_dotenv
 from google import genai
 from google.genai.errors import ClientError
 import streamlit as st
 
-import os, json
-import streamlit as st
 
 # Write Google key to a temp file
 keyfile = "/tmp/sa.json"
@@ -44,7 +40,7 @@ print("Using project   :", running_project)
 print("Target location :", os.environ.get("GOOGLE_CLOUD_LOCATION"))
 
 
-refresh_token = os.getenv("REDDIT_REFRESH_TOKEN")
+refresh_token = REFRESH_TOKEN
 if not refresh_token:
     raise RuntimeError("Please run get_refresh_token() first to populate REDDIT_REFRESH_TOKEN in .env")
 

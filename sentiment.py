@@ -7,6 +7,7 @@ import prawcore
 from google import genai
 from google.genai.errors import ClientError
 import streamlit as st
+from google.genai.types import Schema, Type  # <-- schema types
 
 
 # Write Google key to a temp file
@@ -157,30 +158,42 @@ def summarize_market_consensus(comments: list[str], chunk_size=20) -> str:
 # ─── Classification via generate_content ────────────────────────────────────────
 def classify_comments_with_gemini(comments: list[str]) -> list[dict]:
     model = "gemini-2.5-flash-lite-preview-06-17"
+
     numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(comments, start=1))
     prompt = f"""
-        Below are Reddit comments. Return *only* a JSON array of objects like:
-        [{{"index":1,"label":"BOT"|"HUMAN","reason":"..."}}, …]
+You are a JSON-only responder. Return exactly a JSON array for the items below.
+Format: [{{"index":1,"label":"BOT"|"HUMAN","reason":"..." }}, ...]
+No prose, no code fences.
 
-        {numbered}
-        """
-    resp = safe_generate_content(prompt, model)
-    raw = resp.text.strip()
-    # 1) If fenced with ``` or ```json, remove them:
-    if raw.startswith("```"):
-        # drop leading fence
-        raw = raw.split("\n", 1)[1]
-        # drop trailing fence
-        raw = raw.rsplit("```", 1)[0].strip()
-    # 2) Extract the JSON array between the first '[' and the last ']'
-    start = raw.find("[")
-    end   = raw.rfind("]")
-    if start == -1 or end == -1:
-        raise ValueError(f"Could not find JSON array in response:\n{raw}")
-    json_text = raw[start : end+1]
+Comments:
+{numbered}
+"""
 
-    # 3) Parse and return
-    return json.loads(json_text)
+    # Enforce JSON output (and shape) from the API
+    schema = Schema(
+        type=Type.ARRAY,
+        items=Schema(
+            type=Type.OBJECT,
+            properties={
+                "index": Schema(type=Type.INTEGER),
+                "label": Schema(type=Type.STRING, enum=["BOT", "HUMAN"]),
+                "reason": Schema(type=Type.STRING),
+            },
+            required=["index", "label", "reason"],
+        ),
+    )
+
+    resp = vertex_client.models.generate_content(
+        model=model,
+        contents=[prompt],
+        config={
+            "response_mime_type": "application/json",
+            "response_schema": schema,
+        },
+    )
+
+    # Should be pure JSON now; no fences, no extra text
+    return json.loads(resp.text)
 # ─── Main Flow ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     USERNAME = "wsbapp"

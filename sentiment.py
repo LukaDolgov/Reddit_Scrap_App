@@ -179,7 +179,7 @@ def summarize_market_consensus(comments: list[str], chunk_size=20) -> str:
 def classify_comments_with_gemini(comments: list[str]) -> list[dict]:
     model = "gemini-2.5-flash-lite-preview-06-17"
 
-    numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(comments, start=1))
+    numbered = "\n".join(f"{i}. {c}" for i, c in enumerate(comments, start=1))
     prompt = f"""
 You are a JSON-only responder. Return exactly a JSON array for the items below.
 Format: [{{"index":1,"label":"BOT"|"HUMAN","reason":"..." }}, ...]

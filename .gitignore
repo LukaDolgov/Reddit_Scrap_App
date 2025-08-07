@@ -1,0 +1,4 @@
+.env
+*.json
+main.py
+r_auth.py

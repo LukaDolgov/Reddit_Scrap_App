@@ -1,0 +1,4 @@
+streamlit
+praw
+google-genai
+python-dotenv

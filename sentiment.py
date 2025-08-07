@@ -264,7 +264,7 @@ if __name__ == "__main__":
         if st.button("♻️ Clear results"):
             for k in ("classifications", "rows", "consensus", "analysis_ready"):
                 st.session_state.pop(k, None)
-            st.experimental_rerun()
+            st.rerun()
 
     # 1) Fetch comments (cached; doesn't hit Gemini)
     bodies = get_bodies(USERNAME, limit=LIMIT, sort=SORT)

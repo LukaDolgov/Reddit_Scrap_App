@@ -230,56 +230,75 @@ def attach_comments_to_results(comments: List[str], results: List[Dict]) -> List
 if __name__ == "__main__":
     st.title("Reddit Market Sentiment Analysis")
 
-    # Controls (optional)
-    USERNAME = "wsbapp"
-    LIMIT = 50
+    # Controls
+    USERNAME = st.text_input("Reddit username", "wsbapp")
+    LIMIT = st.slider("Top-level comments to fetch", 10, 100, 50, 10)
+    SORT = st.selectbox("Comment sort", ["new", "best", "top", "old", "controversial"], index=0)
 
-    # Manual refresh button
-    if st.button("🔄 Refresh now"):
-        st.cache_data.clear()
-        st.rerun()
+    cols = st.columns(3)
+    with cols[0]:
+        analyze_clicked = st.button("🔎 Analyze (uses Gemini)")
+    with cols[1]:
+        if st.button("🔄 Refresh comments (no Gemini)"):
+            st.cache_data.clear()   # clear cached bodies/classifications/summaries
+            st.rerun()
+    with cols[2]:
+        if st.button("♻️ Clear results"):
+            for k in ("classifications", "rows", "consensus", "analysis_ready"):
+                st.session_state.pop(k, None)
+            st.experimental_rerun()
 
-    # 1) Fetch comments (cached)
-    bodies = get_bodies(USERNAME, limit=LIMIT, sort="new")
+    # 1) Fetch comments (cached; doesn't hit Gemini)
+    bodies = get_bodies(USERNAME, limit=LIMIT, sort=SORT)
     if not bodies:
-        st.error(f"No submissions/comments found for {USERNAME}")
-        raise SystemExit
+        st.info("No comments found yet. Try a different user or refresh.")
+        st.stop()
 
-    # 2) Classify (cached)
-    st.subheader("Fetching & classifying…")
-    classifications = classify_batch(bodies[:LIMIT])
+    # 2) Only run Gemini when the button is clicked
+    if analyze_clicked:
+        with st.spinner("Classifying and summarizing with Gemini…"):
+            classifications = classify_batch(bodies[:LIMIT])  # cached; won’t re-hit within ttl
+            rows = attach_comments_to_results(bodies[:LIMIT], classifications)
+            human_bodies = [b for b, cls in zip(bodies[:LIMIT], classifications)
+                            if cls.get("label") != "BOT"]
+            consensus = summarize_cached(human_bodies, chunk_size=LIMIT)  # cached
 
-    # 3) Attach original comment text
-    rows = attach_comments_to_results(bodies[:LIMIT], classifications)
-    df = pd.DataFrame(rows)
+            # Persist for later reruns
+            st.session_state.classifications = classifications
+            st.session_state.rows = rows
+            st.session_state.consensus = consensus
+            st.session_state.analysis_ready = True
 
-    # 4) Filter out BOTs then summarize (both cached)
-    human_bodies = [b for b, cls in zip(bodies[:LIMIT], classifications) if cls.get("label") != "BOT"]
-    consensus = summarize_cached(human_bodies, chunk_size=LIMIT)
+    # 3) Render results if we have them
+    if st.session_state.get("analysis_ready"):
+        rows = st.session_state.rows
+        df = pd.DataFrame(rows)
 
-    # ---------- UI ----------
-    tabs = st.tabs(["👥 Classification", "📈 Summary"])
+        tabs = st.tabs(["👥 Classification", "📈 Summary"])
 
-    with tabs[0]:
-        st.subheader("Bot/Human Classification")
-        labels = st.multiselect("Filter by label", ["HUMAN", "BOT"], default=["HUMAN", "BOT"])
-        fdf = df[df["label"].isin(labels)].copy()
-        fdf["Comment (preview)"] = fdf["comment"].apply(lambda s: shorten(s, width=180, placeholder="…"))
-        st.dataframe(
-            fdf[["index", "label", "reason", "Comment (preview)"]]
-              .rename(columns={"index": "Index", "label": "Label", "reason": "Reason"}),
-            use_container_width=True,
-            hide_index=True,
-        )
+        with tabs[0]:
+            st.subheader("Bot/Human Classification")
+            labels = st.multiselect("Filter by label", ["HUMAN", "BOT"], default=["HUMAN", "BOT"])
+            fdf = df[df["label"].isin(labels)].copy()
+            fdf["Comment (preview)"] = fdf["comment"].apply(
+                lambda s: shorten(s, width=180, placeholder="…")
+            )
+            st.dataframe(
+                fdf[["index", "label", "reason", "Comment (preview)"]]
+                  .rename(columns={"index": "Index", "label": "Label", "reason": "Reason"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.write("")
+            st.subheader("Full comments")
+            for r in fdf.sort_values("index").to_dict("records"):
+                with st.expander(f"#{r['index']} • {r['label']} • {shorten(r['reason'], 90, '…')}"):
+                    st.write(r["comment"])
 
-        st.write("")  # spacer
-        st.subheader("Full comments")
-        for r in fdf.sort_values("index").to_dict("records"):
-            with st.expander(f"#{r['index']} • {r['label']} • {shorten(r['reason'], 90, placeholder='…')}"):
-                st.write(r["comment"])
-
-    with tabs[1]:
-        st.subheader("Market Consensus (Humans Only)")
-        summary_bullets = [line.strip() for line in consensus.split("\n") if line.strip()]
-        for bullet in summary_bullets:
-            st.markdown(f"- {bullet}")
+        with tabs[1]:
+            st.subheader("Market Consensus (Humans Only)")
+            summary_bullets = [ln.strip() for ln in st.session_state.consensus.split("\n") if ln.strip()]
+            for bullet in summary_bullets:
+                st.markdown(f"- {bullet}")
+    else:
+        st.info("Click **Analyze** to run Gemini classification and summarization.")

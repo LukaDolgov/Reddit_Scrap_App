@@ -10,11 +10,25 @@ from google import genai
 from google.genai.errors import ClientError
 import streamlit as st
 
+import os, json
+import streamlit as st
+
+# Write Google key to a temp file
+keyfile = "/tmp/sa.json"
+with open(keyfile, "w") as f:
+    f.write(st.secrets["google"]["service_account_key"])
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = keyfile
+os.environ["GOOGLE_CLOUD_PROJECT"]      = "reddit-scrapper-468019"
+os.environ["GOOGLE_CLOUD_LOCATION"]     = "global"
+
+# Reddit creds
+CLIENT_ID     = st.secrets["reddit"]["REDDIT_CLIENT_ID"]
+CLIENT_SECRET = st.secrets["reddit"]["REDDIT_CLIENT_SECRET"]
+REFRESH_TOKEN = st.secrets["reddit"]["REDDIT_REFRESH_TOKEN"]
+USER_AGENT    = st.secrets["reddit"]["REDDIT_USER_AGENT"]
+# … then initialize PRAW and GenAI as before …
+
 # ─── Setup ─────────────────────────────────────────────────────────────────────
-load_dotenv()
-os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", "reddit-scrapper-sa.json")
-os.environ.setdefault("GOOGLE_CLOUD_PROJECT",       "reddit-scrapper-468019")
-os.environ.setdefault("GOOGLE_CLOUD_LOCATION",      "global")
 
 vertex_client = genai.Client(
     vertexai=True,
@@ -30,10 +44,6 @@ print("Using project   :", running_project)
 print("Target location :", os.environ.get("GOOGLE_CLOUD_LOCATION"))
 
 
-CLIENT_ID     = os.getenv("REDDIT_CLIENT_ID")
-CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
-REDIRECT_URI  = os.getenv("REDDIT_REDIRECT_URI", "http://localhost:8080")
-USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "reddit-scrap/0.1 by u/PercentageMinimum45")
 refresh_token = os.getenv("REDDIT_REFRESH_TOKEN")
 if not refresh_token:
     raise RuntimeError("Please run get_refresh_token() first to populate REDDIT_REFRESH_TOKEN in .env")
@@ -43,7 +53,7 @@ reddit = praw.Reddit(
     client_secret=CLIENT_SECRET,
     refresh_token=refresh_token,
     user_agent=USER_AGENT,
-    redirect_uri=REDIRECT_URI,
+    redirect_uri="http://localhost:8080",
     ratelimit_seconds=60,    # PRAW auto-backoff on 429s
 )
 

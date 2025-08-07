@@ -75,7 +75,20 @@ def classify_batch(comments: list[str]) -> list[dict]:
 def summarize_cached(comments: list[str], chunk_size: int = 50) -> str:
     return summarize_market_consensus(comments, chunk_size=chunk_size)
 
+from datetime import datetime, timezone
 
+def render_post_header(submission, sort: str, limit: int):
+    post_url = f"https://reddit.com{submission.permalink}"
+    created = datetime.fromtimestamp(submission.created_utc, tz=timezone.utc).astimezone()
+    author = getattr(submission.author, "name", "[deleted]")
+    subr   = submission.subreddit.display_name
+
+    st.markdown(f"### 📌 Viewing comments for: [{submission.title}]({post_url})")
+    st.caption(
+        f"r/{subr} • by u/{author} • {submission.num_comments} comments • "
+        f"score {submission.score} • {created:%b %d, %Y %I:%M %p %Z} • "
+        f"sort: **{sort}** • showing top-level: **{limit}**"
+    )
 
 # ─── Rate-Limit-Safe replace_more ───────────────────────────────────────────────
 def safe_replace_more(comments, limit):
@@ -88,6 +101,12 @@ def safe_replace_more(comments, limit):
             wait = getattr(e, "retry_after", backoff)
             time.sleep(wait)
             backoff = min(backoff * 2, 60)
+def get_latest_submission_basic(username: str):
+    """Fetch the newest submission for a user without expanding comments."""
+    user = reddit.redditor(username)
+    for post in user.submissions.new(limit=1):
+        return post
+    return None
 
 # ─── Utility: Safe, retriable generate_content with permission check ─────────────
 def safe_generate_content(contents: str, model: str, max_retries=3, backoff=1):
@@ -229,7 +248,6 @@ def attach_comments_to_results(comments: List[str], results: List[Dict]) -> List
 # ─── Main Flow ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     st.title("Reddit Market Sentiment Analysis")
-
     # Controls
     USERNAME = st.text_input("Reddit username", "wsbapp")
     LIMIT = st.slider("Top-level comments to fetch", 10, 100, 50, 10)
@@ -240,7 +258,7 @@ if __name__ == "__main__":
         analyze_clicked = st.button("🔎 Analyze (uses Gemini)")
     with cols[1]:
         if st.button("🔄 Refresh comments (no Gemini)"):
-            st.cache_data.clear()   # clear cached bodies/classifications/summaries
+            st.cache_data.clear()
             st.rerun()
     with cols[2]:
         if st.button("♻️ Clear results"):
@@ -253,6 +271,11 @@ if __name__ == "__main__":
     if not bodies:
         st.info("No comments found yet. Try a different user or refresh.")
         st.stop()
+
+    # 🔹 Show which post we're analyzing (cheap fetch; no comment expansion)
+    submission = get_latest_submission_basic(USERNAME)
+    if submission:
+        render_post_header(submission, SORT, LIMIT)
 
     # 2) Only run Gemini when the button is clicked
     if analyze_clicked:

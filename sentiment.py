@@ -292,7 +292,7 @@ if __name__ == "__main__":
             st.write("")
             st.subheader("Full comments")
             for r in fdf.sort_values("index").to_dict("records"):
-                with st.expander(f"#{r['index']} • {r['label']} • {shorten(r['reason'], 90, '…')}"):
+                with st.expander(f"#{r['index']} • {r['label']} • {shorten(str(r.get('reason','')), width=90, placeholder='…')}"):
                     st.write(r["comment"])
 
         with tabs[1]:

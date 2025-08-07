@@ -8,7 +8,12 @@ from google import genai
 from google.genai.errors import ClientError
 import streamlit as st
 from google.genai.types import Schema, Type  # <-- schema types
+from typing import List, Dict
+import pandas as pd
+import streamlit as st
+from textwrap import shorten
 
+st.set_page_config(page_title="Reddit Sentiment Dashboard", layout="wide")
 
 # Write Google key to a temp file
 keyfile = "/tmp/sa.json"
@@ -26,34 +31,49 @@ USER_AGENT    = st.secrets["reddit"]["REDDIT_USER_AGENT"]
 # … then initialize PRAW and GenAI as before …
 
 # ─── Setup ─────────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_clients():
+    # Reddit
+    reddit = praw.Reddit(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        refresh_token=REFRESH_TOKEN,
+        user_agent=USER_AGENT,
+        redirect_uri="http://localhost:8080",
+        ratelimit_seconds=60,
+    )
 
-vertex_client = genai.Client(
-    vertexai=True,
-    project=os.environ["GOOGLE_CLOUD_PROJECT"],
-    location=os.environ["GOOGLE_CLOUD_LOCATION"],
-)
+    # Gemini
+    vertex_client = genai.Client(
+        vertexai=True,
+        project=os.environ["GOOGLE_CLOUD_PROJECT"],
+        location=os.environ["GOOGLE_CLOUD_LOCATION"],
+    )
 
-from google.auth import default
+    return reddit, vertex_client
 
-creds, running_project = default()
-print("Authenticating as:", getattr(creds, "service_account_email", creds.__class__.__name__))
-print("Using project   :", running_project)
-print("Target location :", os.environ.get("GOOGLE_CLOUD_LOCATION"))
+# materialize once and reuse on reruns
+reddit, vertex_client = get_clients()
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_bodies(username: str, limit: int = 50, sort: str = "new") -> list[str]:
+    """Fetch top-level comments, with caching to avoid refetching every rerun."""
+    submission = get_latest_submission(username)
+    if not submission:
+        return []
+    submission.comment_sort = sort
+    safe_replace_more(submission.comments, limit=0)
+    top_level = submission.comments[:limit]
+    return [c.body.replace("\n", " ") for c in top_level]
 
 
-refresh_token = REFRESH_TOKEN
-if not refresh_token:
-    raise RuntimeError("Please run get_refresh_token() first to populate REDDIT_REFRESH_TOKEN in .env")
+@st.cache_data(ttl=120, show_spinner=False)
+def classify_batch(comments: list[str]) -> list[dict]:
+    return classify_comments_with_gemini(comments)
 
-reddit = praw.Reddit(
-    client_id=CLIENT_ID,
-    client_secret=CLIENT_SECRET,
-    refresh_token=refresh_token,
-    user_agent=USER_AGENT,
-    redirect_uri="http://localhost:8080",
-    ratelimit_seconds=60,    # PRAW auto-backoff on 429s
-)
-
+@st.cache_data(ttl=180, show_spinner=False)
+def summarize_cached(comments: list[str], chunk_size: int = 50) -> str:
+    return summarize_market_consensus(comments, chunk_size=chunk_size)
 
 
 
@@ -194,52 +214,72 @@ Comments:
 
     # Should be pure JSON now; no fences, no extra text
     return json.loads(resp.text)
+
+def attach_comments_to_results(comments: List[str], results: List[Dict]) -> List[Dict]:
+    """results items have 1-based 'index' from your prompt. Add the raw comment text."""
+    out = []
+    for r in results:
+        i = r.get("index")
+        if isinstance(i, int) and 1 <= i <= len(comments):
+            r = {**r, "comment": comments[i-1]}   # 1-based -> 0-based
+        else:
+            r = {**r, "comment": ""}
+        out.append(r)
+    return out
 # ─── Main Flow ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    USERNAME = "wsbapp"
-    submission = get_latest_submission(USERNAME)
-    if not submission:
-        print("No submissions found for", USERNAME)
-        exit(1)
-
-    # 1) Fetch top‐level comments
-    top_level = submission.comments[:50]
-    bodies     = [c.body.replace("\n", " ") for c in top_level]
-
-    # 2) Classify them in one batch
-    print("=== Bot/Human Classification ===")
-    classifications = classify_comments_with_gemini(bodies[:50])
-
-    # 3) Filter out BOT comments
-    human_bodies = [
-        body for body, cls in zip(bodies[:50], classifications)
-        if cls.get("label") != "BOT"
-    ]
-    print(f"Filtered out {len(bodies[:50]) - len(human_bodies)} bot comments, {len(human_bodies)} left.")
-
-    # 4) Summarize only the human comments
-    print("=== Market Consensus (Humans Only) ===")
-    consensus = summarize_market_consensus(human_bodies, 50)
-    print(consensus)
-    st.set_page_config(page_title="Reddit Sentiment Dashboard", layout="wide")
     st.title("Reddit Market Sentiment Analysis")
 
-    # Replace these with your actual data
-    classification_results = [
-        {"index": i+1, "label": cls["label"], "reason": cls["reason"]}
-        for i, cls in enumerate(classifications)
-    ]
-    summary_lines = [line.strip() for line in consensus.split("\n")]
-    # keep only non-empty lines
-    summary_bullets = [line for line in summary_lines if line]
+    # Controls (optional)
+    USERNAME = "wsbapp"
+    LIMIT = 50
 
+    # Manual refresh button
+    if st.button("🔄 Refresh now"):
+        st.cache_data.clear()
+        st.rerun()
 
+    # 1) Fetch comments (cached)
+    bodies = get_bodies(USERNAME, limit=LIMIT, sort="new")
+    if not bodies:
+        st.error(f"No submissions/comments found for {USERNAME}")
+        raise SystemExit
+
+    # 2) Classify (cached)
+    st.subheader("Fetching & classifying…")
+    classifications = classify_batch(bodies[:LIMIT])
+
+    # 3) Attach original comment text
+    rows = attach_comments_to_results(bodies[:LIMIT], classifications)
+    df = pd.DataFrame(rows)
+
+    # 4) Filter out BOTs then summarize (both cached)
+    human_bodies = [b for b, cls in zip(bodies[:LIMIT], classifications) if cls.get("label") != "BOT"]
+    consensus = summarize_cached(human_bodies, chunk_size=LIMIT)
+
+    # ---------- UI ----------
     tabs = st.tabs(["👥 Classification", "📈 Summary"])
+
     with tabs[0]:
         st.subheader("Bot/Human Classification")
-        st.table(classification_results)
+        labels = st.multiselect("Filter by label", ["HUMAN", "BOT"], default=["HUMAN", "BOT"])
+        fdf = df[df["label"].isin(labels)].copy()
+        fdf["Comment (preview)"] = fdf["comment"].apply(lambda s: shorten(s, width=180, placeholder="…"))
+        st.dataframe(
+            fdf[["index", "label", "reason", "Comment (preview)"]]
+              .rename(columns={"index": "Index", "label": "Label", "reason": "Reason"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.write("")  # spacer
+        st.subheader("Full comments")
+        for r in fdf.sort_values("index").to_dict("records"):
+            with st.expander(f"#{r['index']} • {r['label']} • {shorten(r['reason'], 90, placeholder='…')}"):
+                st.write(r["comment"])
 
     with tabs[1]:
-        st.subheader("Market Consensus Summary")
+        st.subheader("Market Consensus (Humans Only)")
+        summary_bullets = [line.strip() for line in consensus.split("\n") if line.strip()]
         for bullet in summary_bullets:
             st.markdown(f"- {bullet}")

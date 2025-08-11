@@ -540,36 +540,56 @@ if __name__ == "__main__":
             classifications = classify_batch(bodies[:LIMIT])  # cached
             rows = attach_comments_to_results(bodies[:LIMIT], classifications)
 
-            # 2) Keep only human comments for fact-checking
+            # 2) Keep only human comments
             human_indices = [i for i, cls in enumerate(classifications, start=1) if cls.get("label") != "BOT"]
             human_bodies   = [bodies[i-1] for i in human_indices]
 
-            # 3) Fact-check humans (uses Google Search grounding when available)
+            # Guard: if no humans, stop early
+            if not human_bodies:
+                st.session_state.classifications = classifications
+                st.session_state.rows = rows
+                st.session_state.consensus = "*(No human comments to analyze.)*"
+                st.session_state.ticker_rows = []
+                st.session_state.ticker_stats = []
+                st.session_state.analysis_ready = True
+                st.stop()
+
+            # 3) Fact-check humans
             factchecks_all = fact_check_batch(human_bodies, use_search=True)  # cached
+            # Build quick verdict map (1-based within human_bodies)
+            fc_by_idx = {fc.get("index"): (fc.get("verdict") or "UNSURE") for fc in (factchecks_all or [])}
 
-            # 4) Filter to only truthy comments (and keep original indices)
-            allowed_verdicts = {"TRUE", "LIKELY_TRUE"}
-            fc_by_idx = {fc.get("index"): fc for fc in factchecks_all}  # 1-based within human_bodies
+            # 4) Truth filter (primary + fallback)
+            allowed_primary = {"TRUE", "LIKELY_TRUE"}
+            allowed_fallback = {"TRUE", "LIKELY_TRUE", "UNSURE"}  # used only if primary yields nothing
 
-            truthy_pairs = []   # list[(global_index, text)]
-            for j in range(1, len(human_bodies) + 1):
-                verdict = (fc_by_idx.get(j) or {}).get("verdict", "UNSURE")
-                if verdict in allowed_verdicts:
-                    truthy_pairs.append((human_indices[j-1], human_bodies[j-1]))
+            # First pass: TRUE/Likely TRUE only
+            truthy_pairs = []
+            for j, c in enumerate(human_bodies, start=1):
+                verdict = fc_by_idx.get(j, "UNSURE")  # default to UNSURE if missing
+                if verdict in allowed_primary:
+                    truthy_pairs.append((human_indices[j-1], c))
+
+            # Fallback: if empty, include UNSURE so UI isn't blank
+            if not truthy_pairs:
+                for j, c in enumerate(human_bodies, start=1):
+                    verdict = fc_by_idx.get(j, "UNSURE")
+                    if verdict in allowed_fallback:
+                        truthy_pairs.append((human_indices[j-1], c))
 
             truthy_comments = [c for (_idx, c) in truthy_pairs]
 
-            # 5) Summarize only truthy comments
+            # 5) Summarize
             consensus = (
                 summarize_cached(truthy_comments, chunk_size=LIMIT)
-                if truthy_comments else "*(No truthy comments to summarize.)*"
+                if truthy_comments else "*(No comments passed truth threshold.)*"
             )
 
-            # 6) Build Tickers & Moves (truth-filtered only)
-            ticker_rows  = extract_ticker_events(truthy_pairs)   # requires helpers I gave you
+            # 6) Tickers & Moves from truth-filtered comments only
+            ticker_rows  = extract_ticker_events(truthy_pairs)   # make sure helpers are added
             ticker_stats = aggregate_ticker_stats(ticker_rows)
 
-            # 7) Persist for reruns
+            # 7) Persist
             st.session_state.classifications = classifications
             st.session_state.rows = rows
             st.session_state.consensus = consensus

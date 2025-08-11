@@ -259,7 +259,7 @@ def fact_check_batch(comments: list[str], use_search: bool = True) -> list[dict]
     if not comments:
         return []
 
-    model = "gemini-2.5-pro"  # higher reasoning; fall back if you prefer flash-lite
+    model = "gemini-2.5-flash-lite-preview-06-17"  # higher reasoning; fall back if you prefer flash-lite
 
     numbered = "\n".join(f"{i}. {c}" for i, c in enumerate(comments, start=1))
     prompt = f"""

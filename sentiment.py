@@ -560,7 +560,7 @@ if __name__ == "__main__":
             fc_by_idx = {fc.get("index"): (fc.get("verdict") or "UNSURE") for fc in (factchecks_all or [])}
 
             # 4) Truth filter (primary + fallback)
-            allowed_primary = {"TRUE", "LIKELY_TRUE"}
+            allowed_primary = {"TRUE", "LIKELY_TRUE", "UNSURE"}
             allowed_fallback = {"TRUE", "LIKELY_TRUE", "UNSURE"}  # used only if primary yields nothing
 
             # First pass: TRUE/Likely TRUE only

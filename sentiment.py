@@ -245,6 +245,129 @@ def attach_comments_to_results(comments: List[str], results: List[Dict]) -> List
             r = {**r, "comment": ""}
         out.append(r)
     return out
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fact_check_batch(comments: list[str], use_search: bool = True) -> list[dict]:
+    """
+    Returns a JSON list of verdicts for each comment with optional live Google Search grounding.
+    Shape:
+      [{"index":1,"verdict":"TRUE|LIKELY_TRUE|UNSURE|LIKELY_FALSE|FALSE",
+        "confidence":0.0..1.0,
+        "claims":[{"text":"...", "support":[{"title":"...", "url":"..."}]}],
+        "reason":"..."}, ...]
+    """
+    if not comments:
+        return []
+
+    model = "gemini-2.5-pro"  # higher reasoning; fall back if you prefer flash-lite
+
+    numbered = "\n".join(f"{i}. {c}" for i, c in enumerate(comments, start=1))
+    prompt = f"""
+You are a rigorous fact-checker. Identify *factual claims* in each comment and assess truthfulness.
+Consider the *current* world state. If evidence is unclear or mixed, use "UNSURE".
+
+Return ONLY a JSON array with one object per comment:
+- index: the 1-based index of the comment
+- verdict: one of ["TRUE","LIKELY_TRUE","UNSURE","LIKELY_FALSE","FALSE"]
+- confidence: number in [0,1]
+- claims: array of objects: {{ "text": str, "support": [{{"title":str, "url":str}}...] }}
+- reason: brief explanation in plain English
+
+Comments:
+{numbered}
+"""
+
+    schema = Schema(
+        type=Type.ARRAY,
+        items=Schema(
+            type=Type.OBJECT,
+            properties={
+                "index": Schema(type=Type.INTEGER),
+                "verdict": Schema(type=Type.STRING, enum=[
+                    "TRUE","LIKELY_TRUE","UNSURE","LIKELY_FALSE","FALSE"
+                ]),
+                "confidence": Schema(type=Type.NUMBER),
+                "claims": Schema(
+                    type=Type.ARRAY,
+                    items=Schema(
+                        type=Type.OBJECT,
+                        properties={
+                            "text": Schema(type=Type.STRING),
+                            "support": Schema(
+                                type=Type.ARRAY,
+                                items=Schema(
+                                    type=Type.OBJECT,
+                                    properties={
+                                        "title": Schema(type=Type.STRING),
+                                        "url": Schema(type=Type.STRING),
+                                    },
+                                    required=["url"]
+                                )
+                            ),
+                        },
+                        required=["text","support"]
+                    )
+                ),
+                "reason": Schema(type=Type.STRING),
+            },
+            required=["index","verdict","confidence","claims","reason"],
+        ),
+    )
+
+    # Prefer search grounding; gracefully fall back if unavailable
+    tools_cfg = [{"google_search": {}}] if use_search else []
+    try:
+        resp = vertex_client.models.generate_content(
+            model=model,
+            contents=[prompt],
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": schema,
+                "tools": tools_cfg,  # enables live search grounding if allowed on your project
+            },
+        )
+        return json.loads(resp.text)
+    except ClientError:
+        # Retry once without search grounding
+        resp = vertex_client.models.generate_content(
+            model=model,
+            contents=[prompt],
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": schema,
+            },
+        )
+        return json.loads(resp.text)
+
+
+def attach_comments_to_factchecks(comments: list[str], facts: list[dict]) -> list[dict]:
+    """Attach raw comment text to each fact-check row by 1-based index."""
+    out = []
+    for r in facts:
+        i = r.get("index")
+        r = {**r, "comment": comments[i-1] if isinstance(i, int) and 1 <= i <= len(comments) else ""}
+        out.append(r)
+    return out
+
+
+def filter_comments_by_truth(
+    comments: list[str],
+    factchecks: list[dict],
+    allowed: set[str] = frozenset({"TRUE","LIKELY_TRUE"})
+) -> list[str]:
+    """
+    Keep only comments whose verdict is in `allowed`.
+    """
+    keep = []
+    fc_by_idx = {fc.get("index"): fc for fc in factchecks}
+    for i, c in enumerate(comments, start=1):
+        v = (fc_by_idx.get(i) or {}).get("verdict", "UNSURE")
+        if v in allowed:
+            keep.append(c)
+    return keep
+
+
+
 # ─── Main Flow ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     st.title("Reddit Market Sentiment Analysis")
@@ -280,13 +403,32 @@ if __name__ == "__main__":
     # 2) Only run Gemini when the button is clicked
     if analyze_clicked:
         with st.spinner("Classifying and summarizing with Gemini…"):
-            classifications = classify_batch(bodies[:LIMIT])  # cached; won’t re-hit within ttl
+            # 1) Classify (HUMAN/BOT)
+            classifications = classify_batch(bodies[:LIMIT])  # cached
             rows = attach_comments_to_results(bodies[:LIMIT], classifications)
-            human_bodies = [b for b, cls in zip(bodies[:LIMIT], classifications)
-                            if cls.get("label") != "BOT"]
-            consensus = summarize_cached(human_bodies, chunk_size=LIMIT)  # cached
 
-            # Persist for later reruns
+            # 2) Keep only human comments for fact-checking
+            human_indices = [i for i, cls in enumerate(classifications, start=1) if cls.get("label") != "BOT"]
+            human_bodies   = [bodies[i-1] for i in human_indices]
+
+            # 3) Fact-check humans (uses Google Search grounding when available)
+            factchecks_all = fact_check_batch(human_bodies, use_search=True)  # cached
+
+            # 4) Filter to only truthy comments for summarization
+            allowed_verdicts = {"TRUE", "LIKELY_TRUE"}
+            truthy_comments = filter_comments_by_truth(
+                human_bodies,
+                factchecks_all,
+                allowed=allowed_verdicts
+            )
+
+            # 5) Summarize only truthy comments
+            consensus = (
+                summarize_cached(truthy_comments, chunk_size=LIMIT)
+                if truthy_comments else "*(No truthy comments to summarize.)*"
+            )
+
+            # 6) Persist for reruns (no separate tab needed)
             st.session_state.classifications = classifications
             st.session_state.rows = rows
             st.session_state.consensus = consensus

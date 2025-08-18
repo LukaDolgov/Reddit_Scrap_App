@@ -46,16 +46,6 @@ CLIENT_SECRET = st.secrets.get("reddit", {}).get("REDDIT_CLIENT_SECRET") or os.e
 REFRESH_TOKEN = st.secrets.get("reddit", {}).get("REDDIT_REFRESH_TOKEN") or os.environ.get("REDDIT_REFRESH_TOKEN")
 USER_AGENT = st.secrets.get("reddit", {}).get("REDDIT_USER_AGENT") or os.environ.get("REDDIT_USER_AGENT", "reddit-scrap/0.1")
 
-# Basic checks / user-visible debug (remove when you are done testing)
-st.info("Initializing credentials...")
-try:
-    import google.auth
-    creds, proj = google.auth.default()
-    st.write("Project detected:", proj)
-    st.write("Service account (if any):", getattr(creds, "service_account_email", type(creds).__name__))
-    st.write("Location:", os.environ.get("GOOGLE_CLOUD_LOCATION"))
-except Exception as e:
-    st.warning("google.auth.default() failed: " + str(e))
 
 # ----- Try to reuse existing functions from sentiment.py if present -----
 HAS_SENTIMENT_MODULE = False

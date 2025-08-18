@@ -239,27 +239,68 @@ CRYPTO_TICKER_MAP = {
 CASHTAG_RE = re.compile(r'\$([A-Z]{1,6})\b')
 UPPER_TICKER_RE = re.compile(r'\b([A-Z]{2,6})\b')
 FINANCE_WORDS = r'(price|buy|sell|shares|stock|short|long|earnings|dividend|ipo|pump|dump|hodl|sats|moon|chart)'
-
+SLANG_BLACKLIST = {
+    "YOLO","FOMO","LMAO","LOL","WTF","OMG","TBT","FYI","TBH","IMO","IDK","BULL", "MOON"
+}
+COMMON_WORDS_LOW = {"the","and","for","you","not","with","this","that","are","from","about","but","can","has","have","will","all","our","how","who","what","when","where","why","its","in","your","new","use","was","is","it"}
+# keep lowercase set for quick checks
+SLANG_BLACKLIST_LOW = {s.lower() for s in SLANG_BLACKLIST}
 def extract_tickers_from_text(text: str) -> List[str]:
+    """
+    Extract candidate tickers from text:
+      - Always include $CASHTAG tokens.
+      - Include uppercase tokens (2-6 letters) only if:
+         * token not in slang blacklist AND
+         * token not used mostly as lowercase in the same text (heuristic), AND
+         * (token is in finance context nearby OR a later YF validation will confirm it).
+    Returns uppercase tickers (no $).
+    """
     if not text:
         return []
+
     found = set()
-    # cashtags
-    for m in CASHTAG_RE.findall(text):
+    text_str = text or ""
+    lower_text = text_str.lower()
+
+    # 1) cashtags (high confidence)
+    for m in CASHTAG_RE.findall(text_str):
         found.add(m.upper())
-    # uppercase tokens (cautious)
-    for m in UPPER_TICKER_RE.findall(text):
+
+    # 2) uppercase tokens (cautious)
+    # Find all uppercase token candidates
+    for m in UPPER_TICKER_RE.findall(text_str):
         token = m.upper()
-        # skip very common words
-        if token.lower() in {"the","and","for","you","not","with","this","that","are","from","about","but","can","has","have","will","all","our","how","who","what","when","where","why","its","in","your","new","use","was","is","it"}:
+        token_low = token.lower()
+
+        # quick slang / common-word rejection
+        if token_low in SLANG_BLACKLIST_LOW:
             continue
+
+        # avoid common English words (existing check)
+        if token_low in COMMON_WORDS_LOW:
+            continue
+
+        # heuristic: if token appears in lowercase (e.g., "yolo" in text) many times -> it's not a ticker
+        # Count occurrences of token both cases
+        # if lowercase occurrences > 0 and is same or more than uppercase occurrences -> skip
+        ups = len(re.findall(r'\b' + re.escape(token) + r'\b', text_str))
+        lows = len(re.findall(r'\b' + re.escape(token_low) + r'\b', lower_text))
+        # if token mostly appears lowercase (natural-language usage), skip
+        if lows > ups and lows >= 2:
+            continue
+
+        # short tokens need finance context nearby (2-3 characters)
         if len(token) <= 3:
             pattern = re.compile(r'(' + re.escape(token) + r').{0,40}\b' + FINANCE_WORDS + r'\b', re.IGNORECASE)
-            if not pattern.search(text):
+            if not pattern.search(text_str):
                 pattern2 = re.compile(r'\b' + FINANCE_WORDS + r'\b.{0,40}(' + re.escape(token) + r')', re.IGNORECASE)
-                if not pattern2.search(text):
+                if not pattern2.search(text_str):
+                    # don't include now — it might be valid across corpus and could be validated later by yfinance
                     continue
+
+        # Passed checks — accept token
         found.add(token)
+
     return list(found)
 
 def find_top_tickers_from_subreddits(reddit_client, subreddits: List[str], hours: int = 24, max_sub_per_sub: int = 150, max_comments_per_submission: int = 200, include_titles: bool = True, validate_with_yf: bool = False, validate_limit: int = 5) -> List[Tuple[str,int]]:

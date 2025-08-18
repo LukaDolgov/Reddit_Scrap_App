@@ -271,7 +271,7 @@ if run:
     st.markdown(f"**Latest post:** {submission.title}")
     # get top-level comments (your get_latest_submission should have done replace_more(limit=0))
     submission.comment_sort = "best"
-    top_level = get_up_to_n_comments(submission, max_comments=200, batch=40, pause_between_batches=1.0)
+    top_level = get_up_to_n_comments(submission, max_comments=400, batch=40, pause_between_batches=1.0)
     comments_texts = [c.body.replace("\n", " ") for c in top_level]
 
     st.write(f"Collected {len(comments_texts)} top-level comments (raw)")

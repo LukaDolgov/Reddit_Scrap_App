@@ -370,7 +370,7 @@ with tabs[0]:
 
         st.markdown(f"**Latest post:** {submission.title if hasattr(submission, 'title') else '—'}")
         submission.comment_sort = "best"
-        top_level = get_up_to_n_comments(submission, max_comments=200, batch=40, pause_between_batches=1.0)
+        top_level = get_up_to_n_comments(submission, max_comments=500, batch=40, pause_between_batches=1.0)
         comments_texts = [c.body.replace("\n", " ") for c in top_level]
         st.write(f"Collected {len(comments_texts)} top-level comments (raw)")
 

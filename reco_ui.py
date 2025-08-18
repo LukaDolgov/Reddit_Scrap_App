@@ -651,10 +651,10 @@ with tabs[1]:
 
 # ---------------- TOP TICKERS TAB ----------------
 with tabs[2]:
-    st.header("Top tickers (today) — quick discovery")
+    st.header("Top tickers (today) — quick discovery (with confidence & weighting)")
     st.markdown(
         "Scan recent posts & comments across a set of subreddits to find the most-mentioned tickers "
-        "today. This uses cashtags and uppercase token heuristics; results can be validated via yfinance."
+        "today. This tab now shows intermediate counts, a Wilson CI for bullish fraction, and upvote-weighted scoring."
     )
 
     # ---------- scanner inputs ----------
@@ -665,6 +665,48 @@ with tabs[2]:
     top_n = st.number_input("Top N tickers to show", value=25, step=5)
     validate_yf = st.checkbox("Validate top candidates with yfinance (slower)", value=False)
     scan_btn = st.button("Scan now for top tickers")
+
+    # ---------- tuning for sentiment scan & confidence ----------
+    posts_per_sub_for_scan = st.number_input("Posts/sample per subreddit (per ticker)", value=6, step=1)
+    comments_per_post_for_scan = st.number_input("Comments/sample per post", value=80, step=10)
+    min_n_total = st.number_input("Minimum n_total for high-confidence", value=30, step=1)
+    use_weighting = st.checkbox("Use upvote-weighting in additional metrics", value=True)
+
+    # ---------- utility helpers ----------
+    def wilson_interval(k: int, n: int, z: float = 1.96):
+        """Wilson score interval for proportion k/n (returns lo, hi)."""
+        if n == 0:
+            return 0.0, 1.0
+        phat = k / n
+        denom = 1 + z*z/n
+        centre = phat + z*z/(2*n)
+        adj = z * math.sqrt((phat*(1-phat) + z*z/(4*n)) / n)
+        lo = (centre - adj) / denom
+        hi = (centre + adj) / denom
+        return max(0.0, lo), min(1.0, hi)
+
+    def comment_weight(score: int) -> float:
+        """Transform comment.score (upvotes) -> positive weight. Use log1p to damp extreme votes."""
+        try:
+            s = max(0, int(score))
+            return 1.0 + math.log1p(s)
+        except Exception:
+            return 1.0
+
+    def classify_comment_token_label(text: str, ignore_tokens: List[str] | None = None) -> str:
+        """
+        Very small deterministic rule: return 'BULL', 'BEAR', or 'NEUTRAL' for a single comment.
+        Uses the same keyword lists as simple_sentiment_score but runs per-comment.
+        """
+        cleaned = remove_ignore_tokens(text, ignore_tokens)
+        cleaned = (cleaned or "").lower()
+        for k in BULL_KEYWORDS:
+            if k in cleaned:
+                return "BULL"
+        for k in BEAR_KEYWORDS:
+            if k in cleaned:
+                return "BEAR"
+        return "NEUTRAL"
 
     # ---------- run scan ----------
     if scan_btn:
@@ -680,7 +722,7 @@ with tabs[2]:
             st.error(f"Failed to create Reddit client: {e}")
             st.stop()
 
-        # run discovery (uses find_top_tickers_from_subreddits if defined earlier)
+        # run discovery (uses your find_top_tickers_from_subreddits helper from above)
         with st.spinner("Scanning for tickers..."):
             try:
                 ranked = find_top_tickers_from_subreddits(
@@ -702,23 +744,16 @@ with tabs[2]:
             st.stop()
 
         # Normalize ranked into DataFrame
-        # ranked expected as list of (ticker, count)
         df_rank = pd.DataFrame(ranked, columns=["Ticker", "Mentions"])
         df_rank = df_rank.sort_values("Mentions", ascending=False).reset_index(drop=True)
         st.subheader("Top tickers (raw)")
         st.dataframe(df_rank.head(int(top_n)))
 
-        # ---------- sentiment scan config ----------
-        posts_per_sub_for_scan = 6           # how many posts per subreddit to sample per ticker
-        comments_per_post_for_scan = 80     # how many comments per post to gather
-        top_scan_limit = min(len(df_rank), max(10, int(top_n)))  # limit number of tickers we scan for sentiment
-
-        st.info(f"Running lightweight sentiment scan for top {top_scan_limit} tickers (this may take a minute).")
-
-        # ---------- per-ticker sentiment scanner ----------
-        def compute_sentiment_for_ticker(ticker_symbol: str, reddit_client, subs_list: List[str], posts_per_sub=3, comments_per_post=50):
-            combined_comments = []
+        # ---------- per-ticker sentiment scanner (improved: keep score + dedupe by text keeping max upvote) ----------
+        def compute_sentiment_for_ticker_enhanced(ticker_symbol: str, reddit_client, subs_list: List[str], posts_per_sub=3, comments_per_post=50):
             ticker_lower = ticker_symbol.lower()
+            # Collect comments as dict body->max_score to dedupe while keeping highest upvote
+            collected = {}
             for sub in subs_list:
                 try:
                     sr = reddit_client.subreddit(sub)
@@ -726,79 +761,171 @@ with tabs[2]:
                     for post in sr.search(query, sort='new', time_filter='day', limit=posts_per_sub):
                         try:
                             post.comments.replace_more(limit=0)
-                            bodies = [c.body for c in post.comments.list()[:comments_per_post] if getattr(c, "body", None)]
+                            # grab comment objects slice
+                            comment_objs = post.comments.list()[:comments_per_post]
+                            for c in comment_objs:
+                                if not getattr(c, "body", None):
+                                    continue
+                                body = c.body.strip()
+                                # update with max score for dedupe
+                                score_val = getattr(c, "score", 0) or 0
+                                prev = collected.get(body)
+                                if prev is None or score_val > prev:
+                                    collected[body] = score_val
                         except Exception:
-                            bodies = []
-                        combined_comments.extend(bodies)
+                            continue
                 except Exception:
-                    # skip subs we cannot access
                     continue
 
-            # dedupe and basic counts
-            combined_comments = list(dict.fromkeys(combined_comments))
-            mentions = len(combined_comments)
-            if mentions == 0:
+            # Build list of comment dicts preserving highest score per unique text
+            combined_comments = [{"body": b, "score": s} for b, s in collected.items()]
+            collected_mentions = len(combined_comments)
+
+            # If nothing collected, return neutral row
+            if collected_mentions == 0:
                 return {
                     "ticker": ticker_symbol,
-                    "mentions": 0,
+                    "collected_mentions": 0,
+                    "relevant_count": 0,
+                    "human_count": 0,
                     "n_bull": 0,
                     "n_bear": 0,
                     "n_total": 0,
                     "score": 0.0,
+                    "weighted_score": 0.0,
                     "p_est": 0.5,
-                    "suggested_usd": 0.0
+                    "wilson_lo": 0.0,
+                    "wilson_hi": 1.0,
+                    "suggested_usd": 0.0,
+                    "low_confidence": True
                 }
 
-            # Filter relevant: prefer cashtag or whole-word ticker presence
-            relevant = []
-            for c in combined_comments:
-                low = (c or "").lower()
+            # Relevance filter: keep comments mentioning cashtag OR whole-word ticker
+            relevant_comments = []
+            for item in combined_comments:
+                low = (item["body"] or "").lower()
                 if f'${ticker_lower}' in low or re.search(r'\b' + re.escape(ticker_lower) + r'\b', low):
-                    relevant.append(c)
-            # fallback: if none matched, use all
-            if not relevant:
-                relevant = combined_comments
+                    relevant_comments.append(item)
+            # fallback: use all if none matched relevance
+            if not relevant_comments:
+                relevant_comments = combined_comments[:]
 
-            # Bot classification (best-effort)
+            relevant_count = len(relevant_comments)
+
+            # Bot classification (Gemini) - needs list of texts
             try:
-                classif = classify_comments_with_gemini(relevant)
+                texts_for_classify = [it["body"] for it in relevant_comments]
+                classif = classify_comments_with_gemini(texts_for_classify)
             except Exception:
-                classif = [{"index": i + 1, "label": "HUMAN"} for i in range(len(relevant))]
+                classif = [{"index": i + 1, "label": "HUMAN"} for i in range(len(relevant_comments))]
 
+            # Build human_comments list of dicts (body, score)
             human_comments = []
-            for i, txt in enumerate(relevant):
+            for i, it in enumerate(relevant_comments):
                 lab = classif[i] if i < len(classif) else {"label": "HUMAN"}
                 label = lab.get("label", "HUMAN") if isinstance(lab, dict) else str(lab)
                 if "BOT" not in label:
-                    human_comments.append(txt)
+                    human_comments.append(it)
 
-            # compute sentiment while ignoring ticker token
+            human_count = len(human_comments)
+
+            # If no human comments, return low-confidence neutral
+            if human_count == 0:
+                return {
+                    "ticker": ticker_symbol,
+                    "collected_mentions": collected_mentions,
+                    "relevant_count": relevant_count,
+                    "human_count": 0,
+                    "n_bull": 0,
+                    "n_bear": 0,
+                    "n_total": 0,
+                    "score": 0.0,
+                    "weighted_score": 0.0,
+                    "p_est": 0.5,
+                    "wilson_lo": 0.0,
+                    "wilson_hi": 1.0,
+                    "suggested_usd": 0.0,
+                    "low_confidence": True
+                }
+
+            # Per-comment classification on keywords (we need per-comment labels for weighting)
             ignore_tokens = [ticker_lower]
-            n_bull, n_bear, n_total, score = simple_sentiment_score(human_comments, ignore_tokens)
+            labels = [classify_comment_token_label(c["body"], ignore_tokens) for c in human_comments]
+            # Unweighted counts
+            n_bull = sum(1 for lab in labels if lab == "BULL")
+            n_bear = sum(1 for lab in labels if lab == "BEAR")
+            n_total = human_count
+
+            # Weighted counts (by comment upvote weight) if requested
+            weighted_bull = weighted_bear = total_weight = 0.0
+            for lab, c in zip(labels, human_comments):
+                w = comment_weight(c.get("score", 0)) if use_weighting else 1.0
+                total_weight += w
+                if lab == "BULL":
+                    weighted_bull += w
+                elif lab == "BEAR":
+                    weighted_bear += w
+
+            # Compute scores:
+            score = (n_bull - n_bear) / max(1, n_total)
+            weighted_score = (weighted_bull - weighted_bear) / max(1.0, total_weight)
+
+            # Wilson CI for proportion of bullish among bull+bear mentions
+            denom = n_bull + n_bear
+            if denom > 0:
+                wilson_lo, wilson_hi = wilson_interval(n_bull, denom)
+            else:
+                # no explicit bull/bear mentions: fallback wide interval
+                wilson_lo, wilson_hi = 0.0, 1.0
+
+            # p_est and suggested USD (use unweighted score for p_est mapping for compatibility)
             p_est = score_to_p(score)
             pos_frac = fractional_kelly(p=p_est, b=reward_risk, fraction=kelly_fraction)
             pos_usd = pos_frac * account_size
 
+            low_confidence = (n_total < min_n_total)
+
             return {
                 "ticker": ticker_symbol,
-                "mentions": mentions,
+                "collected_mentions": collected_mentions,
+                "relevant_count": relevant_count,
+                "human_count": human_count,
                 "n_bull": n_bull,
                 "n_bear": n_bear,
                 "n_total": n_total,
                 "score": score,
+                "weighted_score": weighted_score,
                 "p_est": p_est,
-                "suggested_usd": pos_usd
+                "wilson_lo": wilson_lo,
+                "wilson_hi": wilson_hi,
+                "suggested_usd": pos_usd,
+                "low_confidence": low_confidence
             }
 
         # ---------- run the sentiment scans for top tickers ----------
-        tickers_to_scan = df_rank["Ticker"].tolist()[:top_scan_limit]
+        tickers_to_scan = df_rank["Ticker"].tolist()[:min(len(df_rank), max(10, int(top_n)))]
         scan_results = []
-        with st.spinner("Scanning tickers for sentiment (this may take some time)..."):
+        with st.spinner("Scanning tickers for sentiment & computing confidence..."):
             for t in tickers_to_scan:
                 try:
-                    res = compute_sentiment_for_ticker(t, reddit_client, subs, posts_per_sub=posts_per_sub_for_scan, comments_per_post=comments_per_post_for_scan)
+                    res = compute_sentiment_for_ticker_enhanced(t, reddit_client, subs, posts_per_sub=posts_per_sub_for_scan, comments_per_post=comments_per_post_for_scan)
                 except Exception as e:
-                    res = {"ticker": t, "mentions": 0, "n_bull": 0, "n_bear": 0, "n_total": 0, "score": 0.0, "p_est": 0.5, "suggested_usd": 0.0}
+                    res = {
+                        "ticker": t,
+                        "collected_mentions": 0,
+                        "relevant_count": 0,
+                        "human_count": 0,
+                        "n_bull": 0,
+                        "n_bear": 0,
+                        "n_total": 0,
+                        "score": 0.0,
+                        "weighted_score": 0.0,
+                        "p_est": 0.5,
+                        "wilson_lo": 0.0,
+                        "wilson_hi": 1.0,
+                        "suggested_usd": 0.0,
+                        "low_confidence": True
+                    }
                     st.write(f"Warning: failed scanning {t}: {e}")
                 scan_results.append(res)
 
@@ -806,31 +933,36 @@ with tabs[2]:
             st.warning("No sentiment scan results (maybe reddit client failed).")
             st.stop()
 
+        # Build DataFrame with extra cols
         df_scan = pd.DataFrame(scan_results)
-        # ensure numeric columns
-        df_scan["score"] = pd.to_numeric(df_scan["score"], errors="coerce").fillna(0.0)
-        df_scan["p_est"] = pd.to_numeric(df_scan["p_est"], errors="coerce").fillna(0.5)
-        df_scan["suggested_usd"] = pd.to_numeric(df_scan["suggested_usd"], errors="coerce").fillna(0.0)
-        df_scan = df_scan.sort_values(by="mentions", ascending=False).reset_index(drop=True)
+        # Ensure numeric types
+        numeric_cols = ["collected_mentions", "relevant_count", "human_count", "n_bull", "n_bear", "n_total", "score", "weighted_score", "p_est", "wilson_lo", "wilson_hi", "suggested_usd"]
+        for c in numeric_cols:
+            if c in df_scan.columns:
+                df_scan[c] = pd.to_numeric(df_scan[c], errors="coerce").fillna(0.0)
+
+        df_scan = df_scan.sort_values(by="collected_mentions", ascending=False).reset_index(drop=True)
 
         st.subheader("Per-ticker sentiment summary (scanned candidates)")
-        st.dataframe(df_scan.head(200))
+        # show the most informative columns first
+        display_cols = ["ticker", "collected_mentions", "relevant_count", "human_count", "n_bull", "n_bear", "n_total", "score", "weighted_score", "wilson_lo", "wilson_hi", "p_est", "suggested_usd", "low_confidence"]
+        st.dataframe(df_scan[display_cols].head(200))
 
-        # Most bullish (highest normalized sentiment score)
+        # Most bullish (by score)
         top_bullish = df_scan.sort_values(by="score", ascending=False).head(10).reset_index(drop=True)
-        st.subheader("Top bullish tickers (highest sentiment score)")
-        st.dataframe(top_bullish[["ticker", "mentions", "n_bull", "n_bear", "n_total", "score", "p_est", "suggested_usd"]])
+        st.subheader("Top bullish tickers (highest score)")
+        st.dataframe(top_bullish[display_cols].head(10))
 
-        # Most bearish (lowest normalized sentiment score)
+        # Most bearish (by score)
         top_bearish = df_scan.sort_values(by="score", ascending=True).head(10).reset_index(drop=True)
-        st.subheader("Top bearish tickers (lowest sentiment score)")
-        st.dataframe(top_bearish[["ticker", "mentions", "n_bull", "n_bear", "n_total", "score", "p_est", "suggested_usd"]])
+        st.subheader("Top bearish tickers (lowest score)")
+        st.dataframe(top_bearish[display_cols].head(10))
 
-        # Most polarized (largest absolute score)
+        # Most polarized (largest absolute score) - show weighted variant as well
         df_scan["abs_score"] = df_scan["score"].abs()
         most_polarized = df_scan.sort_values(by="abs_score", ascending=False).head(15).reset_index(drop=True)
         st.subheader("Most polarized tickers (strongest sentiment either way)")
-        st.dataframe(most_polarized[["ticker", "mentions", "n_bull", "n_bear", "n_total", "score", "abs_score"]])
+        st.dataframe(most_polarized[display_cols + ["abs_score"]].head(15))
 
         st.markdown("---")
 
@@ -843,18 +975,27 @@ with tabs[2]:
                 row = df_scan[df_scan["ticker"] == t].iloc[0]
                 quick_results.append((
                     row["ticker"],
-                    int(row["mentions"]),
+                    int(row["collected_mentions"]),
+                    int(row["relevant_count"]),
+                    int(row["human_count"]),
                     int(row["n_bull"]),
                     int(row["n_bear"]),
                     int(row["n_total"]),
                     float(row["score"]),
+                    float(row["weighted_score"]),
+                    float(row["wilson_lo"]),
+                    float(row["wilson_hi"]),
                     float(row["p_est"]),
-                    float(row["suggested_usd"])
+                    float(row["suggested_usd"]),
+                    bool(row["low_confidence"])
                 ))
-            summary = pd.DataFrame(quick_results, columns=["Ticker", "Mentions", "Bull", "Bear", "Total", "Score", "P_est", "Suggested_$"])
+            summary = pd.DataFrame(quick_results, columns=["Ticker", "Collected", "Relevant", "Human", "Bull", "Bear", "Total", "Score", "WeightedScore", "Wilson_lo", "Wilson_hi", "P_est", "Suggested_$", "LowConf"])
             st.dataframe(summary)
 
-        st.caption("Notes: this scan is limited and lightweight — increase posts_per_sub_for_scan/comments_per_post_for_scan for more coverage but be mindful of Reddit rate limits and Gemini/API costs.")
+        st.caption(
+            "Notes: 'Collected' = unique comments scraped, 'Relevant' = mentions that explicitly referenced the ticker, "
+            "'Human' = after bot removal. 'LowConf' marks n_total < min threshold. Wilson interval is on (bull/(bull+bear))."
+        )
 
 st.markdown("---")
 st.caption("Experimental tool — not financial advice. Use with caution.")

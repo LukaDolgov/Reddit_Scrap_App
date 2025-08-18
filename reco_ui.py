@@ -217,8 +217,17 @@ def get_up_to_n_comments(submission, max_comments=500, batch=25, pause_between_b
 # Crypto mapping for BTC and SOL
 # ----------------------------------------------------------------------
 CRYPTO_TICKER_MAP = {
-    "BTC": {"pair": "BTC-USD", "name": "bitcoin", "aliases": ["btc", "bitcoin", "$btc", "sats", "hodl"]},
-    "SOL": {"pair": "SOL-USD", "name": "solana", "aliases": ["sol", "solana", "$sol"]},
+    "BTC": {
+        "pair": "BTC-USD",
+        "name": "bitcoin",
+        # include common words, cashtag, slang and the corn emoji 🌽 used for BTC
+        "aliases": ["btc", "bitcoin", "$btc", "sats", "hodl", "corn", "🌽"],
+    },
+    "SOL": {
+        "pair": "SOL-USD",
+        "name": "solana",
+        "aliases": ["sol", "solana", "$sol"],
+    },
 }
 
 # ----------------------------------------------------------------------
@@ -266,7 +275,7 @@ with tabs[0]:
 
         # get top-level comments (sorted by 'best')
         submission.comment_sort = "best"
-        top_level = get_up_to_n_comments(submission, max_comments=200, batch=40, pause_between_batches=1.0)
+        top_level = get_up_to_n_comments(submission, max_comments=400, batch=40, pause_between_batches=1.0)
         comments_texts = [c.body.replace("\n", " ") for c in top_level]
 
         # classify bots (batch)
@@ -418,7 +427,7 @@ with tabs[1]:
 
         # fetch comments (allow more for crypto)
         try:
-            comments_objs = get_up_to_n_comments(submission, max_comments=800, batch=60, pause_between_batches=1.0)
+            comments_objs = get_up_to_n_comments(submission, max_comments=400, batch=60, pause_between_batches=1.0)
             comments_texts = [c.body.replace("\n", " ") for c in comments_objs]
         except Exception:
             try:

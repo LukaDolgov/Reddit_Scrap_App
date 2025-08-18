@@ -245,6 +245,262 @@ def attach_comments_to_results(comments: List[str], results: List[Dict]) -> List
             r = {**r, "comment": ""}
         out.append(r)
     return out
+
+
+#TRUTH FACT CHECKING
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fact_check_batch(comments: list[str], use_search: bool = True) -> list[dict]:
+    """
+    Returns a JSON list of verdicts for each comment with optional live Google Search grounding.
+    Shape:
+      [{"index":1,"verdict":"TRUE|LIKELY_TRUE|UNSURE|LIKELY_FALSE|FALSE",
+        "confidence":0.0..1.0,
+        "claims":[{"text":"...", "support":[{"title":"...", "url":"..."}]}],
+        "reason":"..."}, ...]
+    """
+    if not comments:
+        return []
+
+    model = "gemini-2.5-flash-lite-preview-06-17"  # higher reasoning; fall back if you prefer flash-lite
+
+    numbered = "\n".join(f"{i}. {c}" for i, c in enumerate(comments, start=1))
+    prompt = f"""
+You are a rigorous fact-checker. Identify *factual claims* in each comment and assess truthfulness.
+Consider the *current* world state. If evidence is unclear or mixed, use "UNSURE".
+
+Return ONLY a JSON array with one object per comment:
+- index: the 1-based index of the comment
+- verdict: one of ["TRUE","LIKELY_TRUE","UNSURE","LIKELY_FALSE","FALSE"]
+- confidence: number in [0,1]
+- claims: array of objects: {{ "text": str, "support": [{{"title":str, "url":str}}...] }}
+- reason: brief explanation in plain English
+
+Comments:
+{numbered}
+"""
+
+    schema = Schema(
+        type=Type.ARRAY,
+        items=Schema(
+            type=Type.OBJECT,
+            properties={
+                "index": Schema(type=Type.INTEGER),
+                "verdict": Schema(type=Type.STRING, enum=[
+                    "TRUE","LIKELY_TRUE","UNSURE","LIKELY_FALSE","FALSE"
+                ]),
+                "confidence": Schema(type=Type.NUMBER),
+                "claims": Schema(
+                    type=Type.ARRAY,
+                    items=Schema(
+                        type=Type.OBJECT,
+                        properties={
+                            "text": Schema(type=Type.STRING),
+                            "support": Schema(
+                                type=Type.ARRAY,
+                                items=Schema(
+                                    type=Type.OBJECT,
+                                    properties={
+                                        "title": Schema(type=Type.STRING),
+                                        "url": Schema(type=Type.STRING),
+                                    },
+                                    required=["url"]
+                                )
+                            ),
+                        },
+                        required=["text","support"]
+                    )
+                ),
+                "reason": Schema(type=Type.STRING),
+            },
+            required=["index","verdict","confidence","claims","reason"],
+        ),
+    )
+
+    # Prefer search grounding; gracefully fall back if unavailable
+    tools_cfg = [{"google_search": {}}] if use_search else []
+    try:
+        resp = vertex_client.models.generate_content(
+            model=model,
+            contents=[prompt],
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": schema,
+                "tools": tools_cfg,  # enables live search grounding if allowed on your project
+            },
+        )
+        return json.loads(resp.text)
+    except ClientError:
+        # Retry once without search grounding
+        resp = vertex_client.models.generate_content(
+            model=model,
+            contents=[prompt],
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": schema,
+            },
+        )
+        return json.loads(resp.text)
+
+
+def attach_comments_to_factchecks(comments: list[str], facts: list[dict]) -> list[dict]:
+    """Attach raw comment text to each fact-check row by 1-based index."""
+    out = []
+    for r in facts:
+        i = r.get("index")
+        r = {**r, "comment": comments[i-1] if isinstance(i, int) and 1 <= i <= len(comments) else ""}
+        out.append(r)
+    return out
+
+
+def filter_comments_by_truth(
+    comments: list[str],
+    factchecks: list[dict],
+    allowed: set[str] = frozenset({"TRUE","LIKELY_TRUE"})
+) -> list[str]:
+    """
+    Keep only comments whose verdict is in `allowed`.
+    """
+    keep = []
+    fc_by_idx = {fc.get("index"): fc for fc in factchecks}
+    for i, c in enumerate(comments, start=1):
+        v = (fc_by_idx.get(i) or {}).get("verdict", "UNSURE")
+        if v in allowed:
+            keep.append(c)
+    return keep
+
+# TICKER TAB
+
+import re
+from collections import defaultdict
+
+TICKER_RE = re.compile(r'\$?[A-Z]{1,5}\b')
+PCT_RE    = re.compile(r'([+-]?\d{1,3}(?:\.\d+)?)[ ]?%')
+PRICE_RE  = re.compile(r'\$([0-9]{1,6}(?:\.[0-9]{1,2})?)')
+
+# Common false positives to ignore when matching bare A-Z tokens as "tickers"
+TICKER_STOP = {
+    "A", "I", "T", "YOLO", "CEO", "CFO", "FDA", "AI", "DD", "IMO", "ETF", "EPS",
+    "GDP", "CPI", "USD", "OTM", "ITM", "ATM", "WSB", "OPEN", "HIGH", "LOW",
+}
+
+ACTIONS = {
+    "BUY":  re.compile(r'\b(buy|load(?:ing)?|accumulate|long)\b', re.I),
+    "SELL": re.compile(r'\b(sell|trim|take profits?|dump)\b', re.I),
+    "HOLD": re.compile(r'\b(hold|baghold|diamond hands?)\b', re.I),
+    "SHORT":re.compile(r'\b(short|puts?)\b', re.I),
+    "COVER":re.compile(r'\b(cover(?:ing)?)\b', re.I),
+}
+DIRECTION_UP   = re.compile(r'\b(up|rip|pump|moon|surge|spike|green)\b', re.I)
+DIRECTION_DOWN = re.compile(r'\b(down|dump|tank|plunge|red|crash)\b', re.I)
+
+def _clean_ticker(tok: str) -> str:
+    tok = tok.lstrip('$')
+    return tok
+
+def _find_tickers(text: str) -> list[str]:
+    found = []
+    for m in TICKER_RE.finditer(text):
+        t = _clean_ticker(m.group(0))
+        if 1 <= len(t) <= 5 and t.isupper() and t not in TICKER_STOP:
+            found.append(t)
+    # Deduplicate but preserve order
+    seen = set(); out=[]
+    for t in found:
+        if t not in seen:
+            seen.add(t); out.append(t)
+    return out
+
+def _detect_action(text: str) -> str:
+    for label, rx in ACTIONS.items():
+        if rx.search(text):
+            return label
+    if DIRECTION_UP.search(text):
+        return "UP"
+    if DIRECTION_DOWN.search(text):
+        return "DOWN"
+    return "MENTION"
+
+def _first_pct(text: str):
+    m = PCT_RE.search(text)
+    if m:
+        try:
+            return float(m.group(1))
+        except:
+            return None
+    return None
+
+def _first_price(text: str):
+    m = PRICE_RE.search(text)
+    if m:
+        try:
+            return float(m.group(1))
+        except:
+            return None
+    return None
+
+def extract_ticker_events(truthy_pairs: list[tuple[int, str]]) -> list[dict]:
+    """
+    truthy_pairs: list of (global_index, comment_text) for comments that passed truth filter.
+    Returns rows like:
+      {"index": int, "ticker": "AAPL", "action": "BUY|SELL|HOLD|SHORT|COVER|UP|DOWN|MENTION",
+       "move_pct": float|None, "price": float|None, "context": "..."}
+    """
+    rows = []
+    for idx, text in truthy_pairs:
+        tickers = _find_tickers(text)
+        if not tickers:
+            continue
+        action  = _detect_action(text)
+        pct     = _first_pct(text)
+        price   = _first_price(text)
+
+        for t in tickers:
+            rows.append({
+                "index": idx,
+                "ticker": t,
+                "action": action,
+                "move_pct": pct,
+                "price": price,
+                "context": shorten(text, width=180, placeholder="…"),
+            })
+    return rows
+
+def aggregate_ticker_stats(rows: list[dict]) -> list[dict]:
+    """
+    Simple aggregates per ticker.
+    """
+    agg = defaultdict(lambda: {"mentions":0, "avg_move_pct":None, "buy":0,"sell":0,"hold":0,"short":0})
+    for r in rows:
+        t = r["ticker"]
+        agg[t]["mentions"] += 1
+        if r.get("move_pct") is not None:
+            # running average
+            cur = agg[t]["avg_move_pct"]
+            n   = agg[t]["mentions"]
+            agg[t]["avg_move_pct"] = (r["move_pct"] if cur is None else (cur*(n-1) + r["move_pct"])/n)
+        act = r.get("action","MENTION")
+        if act == "BUY":   agg[t]["buy"]   += 1
+        if act == "SELL":  agg[t]["sell"]  += 1
+        if act == "HOLD":  agg[t]["hold"]  += 1
+        if act == "SHORT": agg[t]["short"] += 1
+
+    out = []
+    for t, v in agg.items():
+        out.append({
+            "ticker": t,
+            "mentions": v["mentions"],
+            "avg_move_pct": (None if v["avg_move_pct"] is None else round(v["avg_move_pct"], 2)),
+            "BUY": v["buy"],
+            "SELL": v["sell"],
+            "HOLD": v["hold"],
+            "SHORT": v["short"],
+        })
+    # sort by mentions desc
+    out.sort(key=lambda x: (-x["mentions"], x["ticker"]))
+    return out
+
 # ─── Main Flow ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     st.title("Reddit Market Sentiment Analysis")
@@ -280,16 +536,65 @@ if __name__ == "__main__":
     # 2) Only run Gemini when the button is clicked
     if analyze_clicked:
         with st.spinner("Classifying and summarizing with Gemini…"):
-            classifications = classify_batch(bodies[:LIMIT])  # cached; won’t re-hit within ttl
+            # 1) Classify (HUMAN/BOT)
+            classifications = classify_batch(bodies[:LIMIT])  # cached
             rows = attach_comments_to_results(bodies[:LIMIT], classifications)
-            human_bodies = [b for b, cls in zip(bodies[:LIMIT], classifications)
-                            if cls.get("label") != "BOT"]
-            consensus = summarize_cached(human_bodies, chunk_size=LIMIT)  # cached
 
-            # Persist for later reruns
+            # 2) Keep only human comments
+            human_indices = [i for i, cls in enumerate(classifications, start=1) if cls.get("label") != "BOT"]
+            human_bodies   = [bodies[i-1] for i in human_indices]
+
+            # Guard: if no humans, stop early
+            if not human_bodies:
+                st.session_state.classifications = classifications
+                st.session_state.rows = rows
+                st.session_state.consensus = "*(No human comments to analyze.)*"
+                st.session_state.ticker_rows = []
+                st.session_state.ticker_stats = []
+                st.session_state.analysis_ready = True
+                st.stop()
+
+            # 3) Fact-check humans
+            factchecks_all = fact_check_batch(human_bodies, use_search=True)  # cached
+            # Build quick verdict map (1-based within human_bodies)
+            fc_by_idx = {fc.get("index"): (fc.get("verdict") or "UNSURE") for fc in (factchecks_all or [])}
+
+            # 4) Truth filter (primary + fallback)
+            allowed_primary = {"TRUE", "LIKELY_TRUE", "UNSURE"}
+            allowed_fallback = {"TRUE", "LIKELY_TRUE", "UNSURE"}  # used only if primary yields nothing
+
+            # First pass: TRUE/Likely TRUE only
+            truthy_pairs = []
+            for j, c in enumerate(human_bodies, start=1):
+                verdict = fc_by_idx.get(j, "UNSURE")  # default to UNSURE if missing
+                if verdict in allowed_primary:
+                    truthy_pairs.append((human_indices[j-1], c))
+
+            # Fallback: if empty, include UNSURE so UI isn't blank
+            if not truthy_pairs:
+                for j, c in enumerate(human_bodies, start=1):
+                    verdict = fc_by_idx.get(j, "UNSURE")
+                    if verdict in allowed_fallback:
+                        truthy_pairs.append((human_indices[j-1], c))
+
+            truthy_comments = [c for (_idx, c) in truthy_pairs]
+
+            # 5) Summarize
+            consensus = (
+                summarize_cached(truthy_comments, chunk_size=LIMIT)
+                if truthy_comments else "*(No comments passed truth threshold.)*"
+            )
+
+            # 6) Tickers & Moves from truth-filtered comments only
+            ticker_rows  = extract_ticker_events(truthy_pairs)   # make sure helpers are added
+            ticker_stats = aggregate_ticker_stats(ticker_rows)
+
+            # 7) Persist
             st.session_state.classifications = classifications
             st.session_state.rows = rows
             st.session_state.consensus = consensus
+            st.session_state.ticker_rows = ticker_rows
+            st.session_state.ticker_stats = ticker_stats
             st.session_state.analysis_ready = True
 
     # 3) Render results if we have them
@@ -297,8 +602,9 @@ if __name__ == "__main__":
         rows = st.session_state.rows
         df = pd.DataFrame(rows)
 
-        tabs = st.tabs(["👥 Classification", "📈 Summary"])
+        tabs = st.tabs(["👥 Classification", "📊 Tickers & Moves", "📈 Summary"])
 
+        # --- Tab 0: Classification ---
         with tabs[0]:
             st.subheader("Bot/Human Classification")
             labels = st.multiselect("Filter by label", ["HUMAN", "BOT"], default=["HUMAN", "BOT"])
@@ -308,7 +614,7 @@ if __name__ == "__main__":
             )
             st.dataframe(
                 fdf[["index", "label", "reason", "Comment (preview)"]]
-                  .rename(columns={"index": "Index", "label": "Label", "reason": "Reason"}),
+                .rename(columns={"index": "Index", "label": "Label", "reason": "Reason"}),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -318,10 +624,61 @@ if __name__ == "__main__":
                 with st.expander(f"#{r['index']} • {r['label']} • {shorten(str(r.get('reason','')), width=90, placeholder='…')}"):
                     st.write(r["comment"])
 
+        # --- Tab 1: Tickers & Moves (truth-filtered only) ---
         with tabs[1]:
-            st.subheader("Market Consensus (Humans Only)")
-            summary_bullets = [ln.strip() for ln in st.session_state.consensus.split("\n") if ln.strip()]
-            for bullet in summary_bullets:
-                st.markdown(f"- {bullet}")
+            st.subheader("Tickers & Moves (truth-filtered)")
+            tr = st.session_state.get("ticker_rows", [])    # list of event rows
+            ts = st.session_state.get("ticker_stats", [])   # per-ticker aggregates
+
+            if not tr:
+                st.info("No ticker mentions found in truth-filtered comments.")
+            else:
+                df_events = pd.DataFrame(tr)
+                df_stats  = pd.DataFrame(ts)
+
+                left, right = st.columns(2)
+                with left:
+                    st.markdown("**Per-Ticker Summary**")
+                    if not df_stats.empty:
+                        st.dataframe(
+                            df_stats.rename(columns={
+                                "ticker":"Ticker","mentions":"Mentions","avg_move_pct":"Avg %","BUY":"BUY","SELL":"SELL","HOLD":"HOLD","SHORT":"SHORT"
+                            }),
+                            use_container_width=True, hide_index=True
+                        )
+                    else:
+                        st.caption("No aggregate stats available.")
+
+                with right:
+                    st.markdown("**Most Mentioned (bar)**")
+                    if not df_stats.empty and "mentions" in df_stats.columns:
+                        # ensure numeric type for chart
+                        df_stats["mentions"] = pd.to_numeric(df_stats["mentions"], errors="coerce").fillna(0).astype(int)
+                        st.bar_chart(df_stats.set_index("ticker")["mentions"])
+                    else:
+                        st.caption("Nothing to chart yet.")
+
+                st.write("")
+                st.markdown("**Detected Events**")
+                st.dataframe(
+                    df_events[["index","ticker","action","move_pct","price","context"]]
+                        .rename(columns={
+                            "index":"Comment #","ticker":"Ticker","action":"Action",
+                            "move_pct":"% Move","price":"$ Price","context":"Context"
+                        }),
+                    use_container_width=True, hide_index=True
+                )
+                st.caption("Rows derived only from truth-filtered comments.")
+
+        # --- Tab 2: Summary (truth-filtered only) ---
+        with tabs[2]:
+            st.subheader("Market Consensus (truth-filtered)")
+            summary_text = st.session_state.get("consensus", "")
+            if not summary_text:
+                st.info("No summary available.")
+            else:
+                summary_bullets = [ln.strip() for ln in summary_text.split("\n") if ln.strip()]
+                for bullet in summary_bullets:
+                    st.markdown(f"- {bullet}")
     else:
         st.info("Click **Analyze** to run Gemini classification and summarization.")

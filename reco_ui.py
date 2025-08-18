@@ -105,7 +105,7 @@ except Exception:
 
 # Keep your original simple sentiment keywords
 BULL_KEYWORDS = {"buy", "bull", "moon", "long", "pump", "call", "rocket", "tendies", "alpha", "hodl"}
-BEAR_KEYWORDS = {"sell", "bear", "short", "dump", "exit", "weak", "stop", "down"}
+BEAR_KEYWORDS = {"sell", "bear", "short", "dump", "exit", "weak", "stop", "down", "unload"}
 
 def simple_sentiment_score(comments: List[str]):
     """Return (n_bull, n_bear, n_total, score_norm) for list of comment strings."""

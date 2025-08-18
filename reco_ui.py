@@ -57,7 +57,7 @@ except Exception as e:
 
 # Try to reuse your existing functions. If not found, minimal fallbacks are used.
 try:
-    from sentiment import get_latest_submission, classify_comments_with_gemini
+    from sentiment import get_latest_submission, classify_comments_with_gemini, safe_replace_more
 except Exception:
     # Minimal fallback to fetch comments if you don't have sentiment.py in path.
     def get_latest_submission(username):
@@ -65,6 +65,43 @@ except Exception:
     def classify_comments_with_gemini(comments):
         # naive fallback: mark all as HUMAN (no Gemini)
         return [{"index": i+1, "label": "HUMAN", "reason": ""} for i in range(len(comments))]
+    
+    
+    
+    
+
+def get_up_to_n_comments(submission, max_comments=500, batch=25, pause_between_batches=0.5):
+    """
+    Return up to max_comments Comment objects from `submission`.
+    - batch: how many 'MoreComments' placeholders to expand per iteration
+    - pause_between_batches: small sleep to avoid blasting Reddit
+    """
+    # 1) Make sure we have the initial page of top-level comments (no deep expansion)
+    safe_replace_more(submission.comments, limit=0)
+    comments = submission.comments.list()
+    if len(comments) >= max_comments:
+        return comments[:max_comments]
+
+    # 2) Iteratively expand more placeholders in batches until we have enough or nothing more to fetch
+    while len(comments) < max_comments:
+        prev_len = len(comments)
+        try:
+            safe_replace_more(submission.comments, limit=batch)
+        except Exception as e:
+            # If safe_replace_more raises for any other reason, bail gracefully
+            print("Error expanding more comments:", e)
+            break
+
+        # small polite pause so we don't burn rate limits
+        if pause_between_batches:
+            time.sleep(pause_between_batches)
+
+        comments = submission.comments.list()
+        # if calling replace_more didn't increase the number of comments, we've exhausted reachable comments
+        if len(comments) == prev_len:
+            break
+
+    return comments[:max_comments]
 
 # ---------- Helper utilities ----------
 BULL_KEYWORDS = {"buy", "bull", "moon", "long", "pump", "call", "rocket", "tendies", "alpha"}
@@ -144,7 +181,8 @@ if run:
 
     st.markdown(f"**Latest post:** {submission.title}")
     # get top-level comments (your get_latest_submission should have done replace_more(limit=0))
-    top_level = submission.comments[:50]
+    submission.comment_sort = "best"
+    top_level = get_up_to_n_comments(submission, max_comments=200, batch=40, pause_between_batches=1.0)
     comments_texts = [c.body.replace("\n", " ") for c in top_level]
 
     # classify bots (batch)

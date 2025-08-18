@@ -5,6 +5,55 @@ import numpy as np
 import yfinance as yf
 import math
 import time
+import os
+
+sa_secret = None
+if st.secrets.get("google") and st.secrets["google"].get("service_account_key"):
+    sa_secret = st.secrets["google"]["service_account_key"]
+
+# Also support a flat key name for convenience
+if not sa_secret and st.secrets.get("GCP_SA_JSON"):
+    sa_secret = st.secrets["GCP_SA_JSON"]
+
+if sa_secret:
+    keyfile = "/tmp/reddit-scrapper-sa.json"
+    with open(keyfile, "w", encoding="utf-8") as f:
+        f.write(sa_secret)
+    try:
+        os.chmod(keyfile, 0o600)
+    except Exception:
+        # Some platforms may not support chmod; ignore if it fails
+        pass
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = keyfile
+
+# ======= Environment variables (from secrets with local fallback) =======
+# Project & location — prefer explicit secret keys if present
+os.environ.setdefault(
+    "GOOGLE_CLOUD_PROJECT",
+    st.secrets.get("google", {}).get("project_id", os.environ.get("GOOGLE_CLOUD_PROJECT", "reddit-scrapper-468019"))
+)
+os.environ.setdefault(
+    "GOOGLE_CLOUD_LOCATION",
+    st.secrets.get("google", {}).get("location", os.environ.get("GOOGLE_CLOUD_LOCATION", "global"))
+)
+
+# Reddit creds — prefer secrets, then environment variables for local dev
+CLIENT_ID = st.secrets.get("reddit", {}).get("REDDIT_CLIENT_ID") or os.environ.get("REDDIT_CLIENT_ID")
+CLIENT_SECRET = st.secrets.get("reddit", {}).get("REDDIT_CLIENT_SECRET") or os.environ.get("REDDIT_CLIENT_SECRET")
+REFRESH_TOKEN = st.secrets.get("reddit", {}).get("REDDIT_REFRESH_TOKEN") or os.environ.get("REDDIT_REFRESH_TOKEN")
+USER_AGENT = st.secrets.get("reddit", {}).get("REDDIT_USER_AGENT") or os.environ.get("REDDIT_USER_AGENT", "reddit-scrap/0.1")
+
+# Basic checks / user-visible debug (remove when you are done testing)
+st.info("Initializing credentials...")
+try:
+    import google.auth
+    creds, proj = google.auth.default()
+    st.write("Project detected:", proj)
+    st.write("Service account (if any):", getattr(creds, "service_account_email", type(creds).__name__))
+    st.write("Location:", os.environ.get("GOOGLE_CLOUD_LOCATION"))
+except Exception as e:
+    st.warning("google.auth.default() failed: " + str(e))
+
 
 # Try to reuse your existing functions. If not found, minimal fallbacks are used.
 try:

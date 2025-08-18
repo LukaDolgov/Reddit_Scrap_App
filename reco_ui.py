@@ -240,7 +240,7 @@ CASHTAG_RE = re.compile(r'\$([A-Z]{1,6})\b')
 UPPER_TICKER_RE = re.compile(r'\b([A-Z]{2,6})\b')
 FINANCE_WORDS = r'(price|buy|sell|shares|stock|short|long|earnings|dividend|ipo|pump|dump|hodl|sats|moon|chart)'
 SLANG_BLACKLIST = {
-    "YOLO","FOMO","LMAO","LOL","WTF","OMG","TBT","FYI","TBH","IMO","IDK","BULL", "MOON", "LEAPS", "CASINO", "CHIPS", "OP"
+    "YOLO","FOMO","LMAO","LOL","WTF","OMG","TBT","FYI","TBH","IMO","IDK","BULL", "MOON", "LEAPS", "CASINO", "CHIPS", "OP", "US", "AI", "LETS", "COOP"
 }
 COMMON_WORDS_LOW = {"the","and","for","you","not","with","this","that","are","from","about","but","can","has","have","will","all","our","how","who","what","when","where","why","its","in","your","new","use","was","is","it"}
 # keep lowercase set for quick checks

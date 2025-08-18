@@ -2,3 +2,8 @@ streamlit
 praw
 google-genai
 python-dotenv
+math
+time
+yfinance
+numpy
+pandas

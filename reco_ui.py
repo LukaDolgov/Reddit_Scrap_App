@@ -657,7 +657,7 @@ with tabs[2]:
         "today. This uses cashtags and uppercase token heuristics; results can be validated via yfinance."
     )
 
-    # scanner inputs
+    # ---------- scanner inputs ----------
     subreddits_input = st.text_input("Subreddits (comma-separated)", value="wallstreetbets, stocks, investing, CryptoCurrency")
     hours = st.slider("Hours back", min_value=1, max_value=72, value=24, step=1)
     max_sub_per_sub = st.number_input("Max submissions per subreddit", value=120, step=10)
@@ -666,10 +666,11 @@ with tabs[2]:
     validate_yf = st.checkbox("Validate top candidates with yfinance (slower)", value=False)
     scan_btn = st.button("Scan now for top tickers")
 
+    # ---------- run scan ----------
     if scan_btn:
         subs = [s.strip() for s in subreddits_input.split(",") if s.strip()]
         st.info(f"Scanning subreddits: {subs} for the last {hours} hours — this may take a little while.")
-        # create a lightweight PRAW client (read-only works without refresh token in many cases)
+        # create reddit client (reuse credentials)
         try:
             praw_kwargs = {"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "user_agent": USER_AGENT}
             if REFRESH_TOKEN:
@@ -679,8 +680,8 @@ with tabs[2]:
             st.error(f"Failed to create Reddit client: {e}")
             st.stop()
 
-        # run the scanner
-        with st.spinner("Scanning..."):
+        # run discovery (uses find_top_tickers_from_subreddits if defined earlier)
+        with st.spinner("Scanning for tickers..."):
             try:
                 ranked = find_top_tickers_from_subreddits(
                     reddit_client,
@@ -690,7 +691,7 @@ with tabs[2]:
                     max_comments_per_submission=max_comments_per_submission,
                     include_titles=True,
                     validate_with_yf=validate_yf,
-                    validate_limit=10
+                    validate_limit=25
                 )
             except Exception as e:
                 st.error(f"Ticker discovery failed: {e}")
@@ -698,63 +699,162 @@ with tabs[2]:
 
         if not ranked:
             st.warning("No tickers found by the scanner. Try increasing max_submissions or changing subreddits.")
-        else:
-            df_rank = pd.DataFrame(ranked, columns=["Ticker", "Mentions"])
-            st.subheader("Top tickers")
-            st.dataframe(df_rank.head(top_n))
+            st.stop()
 
-            # allow selecting tickers to quick-analyze
-            selected = st.multiselect("Select tickers to Quick Analyze (sentiment + simple sizing)", options=df_rank["Ticker"].tolist(), default=df_rank["Ticker"].tolist()[:3])
-            if selected:
-                analyze_btn = st.button("Quick analyze selected tickers")
-                if analyze_btn:
-                    # for each selected ticker run a lightweight analyzer (search recent posts for cashtag/ticker)
-                    results = []
-                    for t in selected:
-                        st.write(f"--- Analyzing {t} ---")
-                        # collect comments mentioning ticker (simple subreddit search)
-                        combined_comments = []
-                        for sub in subs:
-                            try:
-                                sr = reddit_client.subreddit(sub)
-                                query = f'"${t}" OR "{t}"'
-                                for post in sr.search(query, sort='new', time_filter='day', limit=10):
-                                    try:
-                                        post.comments.replace_more(limit=0)
-                                        comment_bodies = [c.body for c in post.comments.list()[:100] if getattr(c, "body", None)]
-                                    except Exception:
-                                        comment_bodies = []
-                                    combined_comments.extend(comment_bodies)
-                            except Exception:
-                                continue
-                        combined_comments = list(dict.fromkeys(combined_comments))  # dedupe
-                        st.write(f"Collected {len(combined_comments)} comments for {t}")
-                        # relevance: keep comments that include cashtag or ticker token
-                        relevant = [c for c in combined_comments if (f'${t.lower()}' in c.lower()) or re.search(r'\b' + re.escape(t.lower()) + r'\b', c.lower())]
-                        st.write(f"Relevant comments: {len(relevant)}")
-                        # bot classification (best effort)
+        # Normalize ranked into DataFrame
+        # ranked expected as list of (ticker, count)
+        df_rank = pd.DataFrame(ranked, columns=["Ticker", "Mentions"])
+        df_rank = df_rank.sort_values("Mentions", ascending=False).reset_index(drop=True)
+        st.subheader("Top tickers (raw)")
+        st.dataframe(df_rank.head(int(top_n)))
+
+        # ---------- sentiment scan config ----------
+        posts_per_sub_for_scan = 6           # how many posts per subreddit to sample per ticker
+        comments_per_post_for_scan = 80     # how many comments per post to gather
+        top_scan_limit = min(len(df_rank), max(10, int(top_n)))  # limit number of tickers we scan for sentiment
+
+        st.info(f"Running lightweight sentiment scan for top {top_scan_limit} tickers (this may take a minute).")
+
+        # ---------- per-ticker sentiment scanner ----------
+        def compute_sentiment_for_ticker(ticker_symbol: str, reddit_client, subs_list: List[str], posts_per_sub=3, comments_per_post=50):
+            combined_comments = []
+            ticker_lower = ticker_symbol.lower()
+            for sub in subs_list:
+                try:
+                    sr = reddit_client.subreddit(sub)
+                    query = f'"${ticker_symbol}" OR "{ticker_symbol}"'
+                    for post in sr.search(query, sort='new', time_filter='day', limit=posts_per_sub):
                         try:
-                            cls = classify_comments_with_gemini(relevant)
+                            post.comments.replace_more(limit=0)
+                            bodies = [c.body for c in post.comments.list()[:comments_per_post] if getattr(c, "body", None)]
                         except Exception:
-                            cls = [{"index": i+1, "label":"HUMAN"} for i in range(len(relevant))]
-                        human_comments = []
-                        for i, txt in enumerate(relevant):
-                            lab = cls[i] if i < len(cls) else {"label":"HUMAN"}
-                            label = lab.get("label","HUMAN") if isinstance(lab, dict) else str(lab)
-                            if "BOT" not in label:
-                                human_comments.append(txt)
-                        st.write(f"Human classified comments: {len(human_comments)}")
-                        ignore_tokens = [t.lower()]
-                        n_bull, n_bear, n_tot, raw_score = simple_sentiment_score(human_comments, ignore_tokens)
-                        st.write(f"bulls={n_bull}, bears={n_bear}, total={n_tot}, score={raw_score:.3f}")
-                        p_est_local = score_to_p(raw_score)
-                        pos_frac_local = fractional_kelly(p_est_local, b=reward_risk, fraction=kelly_fraction)
-                        pos_usd_local = pos_frac_local * account_size
-                        st.write(f"Estimated p = {p_est_local:.2f}; suggested position = ${pos_usd_local:,.2f}")
-                        results.append((t, n_bull, n_bear, n_tot, raw_score, p_est_local, pos_usd_local))
-                    # show summary table
-                    summ = pd.DataFrame(results, columns=["Ticker","Bull","Bear","Total","Score","P_est","Suggested_$"])
-                    st.dataframe(summ)
+                            bodies = []
+                        combined_comments.extend(bodies)
+                except Exception:
+                    # skip subs we cannot access
+                    continue
+
+            # dedupe and basic counts
+            combined_comments = list(dict.fromkeys(combined_comments))
+            mentions = len(combined_comments)
+            if mentions == 0:
+                return {
+                    "ticker": ticker_symbol,
+                    "mentions": 0,
+                    "n_bull": 0,
+                    "n_bear": 0,
+                    "n_total": 0,
+                    "score": 0.0,
+                    "p_est": 0.5,
+                    "suggested_usd": 0.0
+                }
+
+            # Filter relevant: prefer cashtag or whole-word ticker presence
+            relevant = []
+            for c in combined_comments:
+                low = (c or "").lower()
+                if f'${ticker_lower}' in low or re.search(r'\b' + re.escape(ticker_lower) + r'\b', low):
+                    relevant.append(c)
+            # fallback: if none matched, use all
+            if not relevant:
+                relevant = combined_comments
+
+            # Bot classification (best-effort)
+            try:
+                classif = classify_comments_with_gemini(relevant)
+            except Exception:
+                classif = [{"index": i + 1, "label": "HUMAN"} for i in range(len(relevant))]
+
+            human_comments = []
+            for i, txt in enumerate(relevant):
+                lab = classif[i] if i < len(classif) else {"label": "HUMAN"}
+                label = lab.get("label", "HUMAN") if isinstance(lab, dict) else str(lab)
+                if "BOT" not in label:
+                    human_comments.append(txt)
+
+            # compute sentiment while ignoring ticker token
+            ignore_tokens = [ticker_lower]
+            n_bull, n_bear, n_total, score = simple_sentiment_score(human_comments, ignore_tokens)
+            p_est = score_to_p(score)
+            pos_frac = fractional_kelly(p=p_est, b=reward_risk, fraction=kelly_fraction)
+            pos_usd = pos_frac * account_size
+
+            return {
+                "ticker": ticker_symbol,
+                "mentions": mentions,
+                "n_bull": n_bull,
+                "n_bear": n_bear,
+                "n_total": n_total,
+                "score": score,
+                "p_est": p_est,
+                "suggested_usd": pos_usd
+            }
+
+        # ---------- run the sentiment scans for top tickers ----------
+        tickers_to_scan = df_rank["Ticker"].tolist()[:top_scan_limit]
+        scan_results = []
+        with st.spinner("Scanning tickers for sentiment (this may take some time)..."):
+            for t in tickers_to_scan:
+                try:
+                    res = compute_sentiment_for_ticker(t, reddit_client, subs, posts_per_sub=posts_per_sub_for_scan, comments_per_post=comments_per_post_for_scan)
+                except Exception as e:
+                    res = {"ticker": t, "mentions": 0, "n_bull": 0, "n_bear": 0, "n_total": 0, "score": 0.0, "p_est": 0.5, "suggested_usd": 0.0}
+                    st.write(f"Warning: failed scanning {t}: {e}")
+                scan_results.append(res)
+
+        if not scan_results:
+            st.warning("No sentiment scan results (maybe reddit client failed).")
+            st.stop()
+
+        df_scan = pd.DataFrame(scan_results)
+        # ensure numeric columns
+        df_scan["score"] = pd.to_numeric(df_scan["score"], errors="coerce").fillna(0.0)
+        df_scan["p_est"] = pd.to_numeric(df_scan["p_est"], errors="coerce").fillna(0.5)
+        df_scan["suggested_usd"] = pd.to_numeric(df_scan["suggested_usd"], errors="coerce").fillna(0.0)
+        df_scan = df_scan.sort_values(by="mentions", ascending=False).reset_index(drop=True)
+
+        st.subheader("Per-ticker sentiment summary (scanned candidates)")
+        st.dataframe(df_scan.head(200))
+
+        # Most bullish (highest normalized sentiment score)
+        top_bullish = df_scan.sort_values(by="score", ascending=False).head(10).reset_index(drop=True)
+        st.subheader("Top bullish tickers (highest sentiment score)")
+        st.dataframe(top_bullish[["ticker", "mentions", "n_bull", "n_bear", "n_total", "score", "p_est", "suggested_usd"]])
+
+        # Most bearish (lowest normalized sentiment score)
+        top_bearish = df_scan.sort_values(by="score", ascending=True).head(10).reset_index(drop=True)
+        st.subheader("Top bearish tickers (lowest sentiment score)")
+        st.dataframe(top_bearish[["ticker", "mentions", "n_bull", "n_bear", "n_total", "score", "p_est", "suggested_usd"]])
+
+        # Most polarized (largest absolute score)
+        df_scan["abs_score"] = df_scan["score"].abs()
+        most_polarized = df_scan.sort_values(by="abs_score", ascending=False).head(15).reset_index(drop=True)
+        st.subheader("Most polarized tickers (strongest sentiment either way)")
+        st.dataframe(most_polarized[["ticker", "mentions", "n_bull", "n_bear", "n_total", "score", "abs_score"]])
+
+        st.markdown("---")
+
+        # ---------- Quick Analyze selected tickers (summary table) ----------
+        st.subheader("Quick Analyze selected tickers")
+        selected = st.multiselect("Select tickers to Quick Analyze (sentiment + sizing)", options=df_scan["ticker"].tolist(), default=df_scan["ticker"].tolist()[:3])
+        if selected:
+            quick_results = []
+            for t in selected:
+                row = df_scan[df_scan["ticker"] == t].iloc[0]
+                quick_results.append((
+                    row["ticker"],
+                    int(row["mentions"]),
+                    int(row["n_bull"]),
+                    int(row["n_bear"]),
+                    int(row["n_total"]),
+                    float(row["score"]),
+                    float(row["p_est"]),
+                    float(row["suggested_usd"])
+                ))
+            summary = pd.DataFrame(quick_results, columns=["Ticker", "Mentions", "Bull", "Bear", "Total", "Score", "P_est", "Suggested_$"])
+            st.dataframe(summary)
+
+        st.caption("Notes: this scan is limited and lightweight — increase posts_per_sub_for_scan/comments_per_post_for_scan for more coverage but be mindful of Reddit rate limits and Gemini/API costs.")
 
 st.markdown("---")
 st.caption("Experimental tool — not financial advice. Use with caution.")
